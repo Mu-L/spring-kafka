@@ -124,6 +124,8 @@ public abstract class AbstractMessageListenerContainer<K, V>
 
 	private volatile boolean running = false;
 
+	private volatile boolean fenced = false;
+
 	private volatile boolean paused;
 
 	private volatile boolean stoppedNormally = true;
@@ -273,6 +275,10 @@ public abstract class AbstractMessageListenerContainer<K, V>
 	@Override
 	public boolean isRunning() {
 		return this.running;
+	}
+
+	protected void setFenced(boolean fenced) {
+		this.fenced = fenced;
 	}
 
 	@Deprecated(since = "3.2", forRemoval = true)
@@ -509,6 +515,7 @@ public abstract class AbstractMessageListenerContainer<K, V>
 			if (!isRunning()) {
 				Assert.state(this.containerProperties.getMessageListener() instanceof GenericMessageListener,
 						() -> "A " + GenericMessageListener.class.getName() + " implementation must be provided");
+				Assert.state(!this.fenced, "Container Fenced. It is not allowed to start.");
 				doStart();
 			}
 		}

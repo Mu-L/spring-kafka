@@ -17,6 +17,7 @@
 package org.springframework.kafka.listener;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.BDDMockito.given;
@@ -207,6 +208,7 @@ public class ConcurrentMessageListenerContainerTests {
 		assertThat(container.metrics()).isNotNull();
 		Set<KafkaMessageListenerContainer<Integer, String>> children = new HashSet<>(containers);
 		assertThat(container.isInExpectedState()).isTrue();
+		MessageListenerContainer childContainer = container.getContainers().get(0);
 		container.getContainers().get(0).stopAbnormally(() -> { });
 		assertThat(container.isInExpectedState()).isFalse();
 		container.getContainers().get(0).start();
@@ -236,6 +238,10 @@ public class ConcurrentMessageListenerContainerTests {
 		});
 		assertThat(overrides.get().getProperty(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG)).isNull();
 		this.logger.info("Stop auto");
+		assertThat(childContainer.isRunning()).isFalse();
+		assertThat(container.isRunning()).isFalse();
+		// Fenced container. Throws exception
+		assertThatExceptionOfType(IllegalStateException.class).isThrownBy(() -> childContainer.start());
 	}
 
 	@Test
