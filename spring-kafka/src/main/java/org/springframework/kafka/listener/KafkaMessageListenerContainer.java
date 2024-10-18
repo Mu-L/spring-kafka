@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledFuture;
@@ -48,6 +49,8 @@ import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationRegistry;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -73,6 +76,7 @@ import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
 
+import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.ApplicationContext;
@@ -106,6 +110,8 @@ import org.springframework.kafka.listener.ContainerProperties.AckMode;
 import org.springframework.kafka.listener.ContainerProperties.AssignmentCommitOption;
 import org.springframework.kafka.listener.ContainerProperties.EOSMode;
 import org.springframework.kafka.listener.adapter.AsyncRepliesAware;
+import org.springframework.kafka.listener.adapter.KafkaBackoffAwareMessageListenerAdapter;
+import org.springframework.kafka.listener.adapter.RecordMessagingMessageListenerAdapter;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.support.KafkaUtils;
@@ -133,9 +139,6 @@ import org.springframework.util.Assert;
 import org.springframework.util.CollectionUtils;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.StringUtils;
-
-import io.micrometer.observation.Observation;
-import io.micrometer.observation.ObservationRegistry;
 
 /**
  * Single-threaded Message listener container using the Java {@link Consumer} supporting
@@ -167,6 +170,7 @@ import io.micrometer.observation.ObservationRegistry;
  * @author Mikael Carlstedt
  * @author Borahm Lee
  * @author Lokesh Alamuri
+ * @author Sanghyeok An
  */
 public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 		extends AbstractMessageListenerContainer<K, V> implements ConsumerPauseResumeEventPublisher {
@@ -840,6 +844,8 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 
 		private volatile long lastPoll = System.currentTimeMillis();
 
+		private final ConcurrentLinkedDeque<FailedRecordTuple<K, V>> failedRecords = new ConcurrentLinkedDeque<>();
+
 		@SuppressWarnings(UNCHECKED)
 		ListenerConsumer(GenericMessageListener<?> listener, ListenerType listenerType,
 				ObservationRegistry observationRegistry) {
@@ -895,6 +901,16 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				this.wantsFullRecords = false;
 				this.pollThreadStateProcessor = setUpPollProcessor(false);
 				this.observationEnabled = this.containerProperties.isObservationEnabled();
+
+				if (!AopUtils.isAopProxy(this.genericListener) &&
+					this.genericListener instanceof KafkaBackoffAwareMessageListenerAdapter<?, ?>) {
+					KafkaBackoffAwareMessageListenerAdapter<K, V> genListener =
+							(KafkaBackoffAwareMessageListenerAdapter<K, V>) this.genericListener;
+					if (genListener.getDelegate() instanceof RecordMessagingMessageListenerAdapter<K, V> adapterListener) {
+						// This means that the async retry feature is supported only for SingleRecordListener with @RetryableTopic.
+						adapterListener.setCallbackForAsyncFailure(this::callbackForAsyncFailure);
+					}
+				}
 			}
 			else {
 				throw new IllegalArgumentException("Listener must be one of 'MessageListener', "
@@ -948,6 +964,10 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			this.lastAlertPartition = new HashMap<>();
 			this.wasIdlePartition = new HashMap<>();
 			this.kafkaAdmin = obtainAdmin();
+
+			if (this.listener instanceof RecordMessagingMessageListenerAdapter<?, ?> rmmla) {
+				rmmla.setObservationRegistry(observationRegistry);
+			}
 		}
 
 		private AckMode determineAckMode() {
@@ -1294,6 +1314,15 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 			boolean failedAuthRetry = false;
 			this.lastReceive = System.currentTimeMillis();
 			while (isRunning()) {
+
+				try {
+					handleAsyncFailure();
+				}
+				catch (Exception e) {
+					ListenerConsumer.this.logger.error(
+							"Failed to process async retry messages. skip this time, try it again next loop.");
+				}
+
 				try {
 					pollAndInvoke();
 					if (failedAuthRetry) {
@@ -1431,6 +1460,26 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				resumeConsumerIfNeccessary();
 				if (!this.consumerPaused) {
 					resumePartitionsIfNecessary();
+				}
+			}
+		}
+
+		protected void handleAsyncFailure() {
+			List<FailedRecordTuple<K, V>> copyFailedRecords = new ArrayList<>(this.failedRecords);
+			this.failedRecords.clear();
+
+			// If any copied and failed record fails to complete due to an unexpected error,
+			// We will give up on retrying with the remaining copied and failed Records.
+			for (FailedRecordTuple<K, V> copyFailedRecord : copyFailedRecords) {
+				try {
+					invokeErrorHandlerBySingleRecord(copyFailedRecord);
+				}
+				catch (Exception e) {
+					this.logger.warn(() ->
+								"Async failed record failed to complete, thus skip it. record :"
+								+ copyFailedRecord.toString()
+								+ ", Exception : "
+								+ e.getMessage());
 				}
 			}
 		}
@@ -2693,6 +2742,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 		 * @throws Error an error.
 		 */
 		@Nullable
+		@SuppressWarnings("try")
 		private RuntimeException doInvokeRecordListener(final ConsumerRecord<K, V> cRecord, // NOSONAR
 				Iterator<ConsumerRecord<K, V>> iterator) {
 
@@ -2703,42 +2753,49 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 					() -> new KafkaRecordReceiverContext(cRecord, getListenerId(), getClientId(), this.consumerGroupId,
 							this::clusterId),
 					this.observationRegistry);
-			return observation.observe(() -> {
-				try {
-					invokeOnMessage(cRecord);
-					successTimer(sample, cRecord);
-					recordInterceptAfter(cRecord, null);
-				}
-				catch (RuntimeException e) {
-					failureTimer(sample, cRecord);
-					recordInterceptAfter(cRecord, e);
-					if (this.commonErrorHandler == null) {
-						throw e;
-					}
+
+			observation.start();
+			try (Observation.Scope ignored = observation.openScope()) {
+				invokeOnMessage(cRecord);
+				successTimer(sample, cRecord);
+				recordInterceptAfter(cRecord, null);
+			}
+			catch (RuntimeException e) {
+				failureTimer(sample, cRecord);
+				recordInterceptAfter(cRecord, e);
+				if (!(this.listener instanceof RecordMessagingMessageListenerAdapter<K, V>)) {
 					observation.error(e);
-					try {
-						invokeErrorHandler(cRecord, iterator, e);
-						commitOffsetsIfNeededAfterHandlingError(cRecord);
-					}
-					catch (RecordInRetryException rire) {
-						this.logger.info("Record in retry and not yet recovered");
-						return rire;
-					}
-					catch (KafkaException ke) {
-						ke.selfLog(ERROR_HANDLER_THREW_AN_EXCEPTION, this.logger);
-						return ke;
-					}
-					catch (RuntimeException ee) {
-						this.logger.error(ee, ERROR_HANDLER_THREW_AN_EXCEPTION);
-						return ee;
-					}
-					catch (Error er) { // NOSONAR
-						this.logger.error(er, "Error handler threw an error");
-						throw er;
-					}
 				}
-				return null;
-			});
+				if (this.commonErrorHandler == null) {
+					throw e;
+				}
+				try {
+					invokeErrorHandler(cRecord, iterator, e);
+					commitOffsetsIfNeededAfterHandlingError(cRecord);
+				}
+				catch (RecordInRetryException rire) {
+					this.logger.info("Record in retry and not yet recovered");
+					return rire;
+				}
+				catch (KafkaException ke) {
+					ke.selfLog(ERROR_HANDLER_THREW_AN_EXCEPTION, this.logger);
+					return ke;
+				}
+				catch (RuntimeException ee) {
+					this.logger.error(ee, ERROR_HANDLER_THREW_AN_EXCEPTION);
+					return ee;
+				}
+				catch (Error er) { // NOSONAR
+					this.logger.error(er, "Error handler threw an error");
+					throw er;
+				}
+			}
+			finally {
+				if (!(this.listener instanceof RecordMessagingMessageListenerAdapter<K, V>)) {
+					observation.stop();
+				}
+			}
+			return null;
 		}
 
 		private void commitOffsetsIfNeededAfterHandlingError(final ConsumerRecord<K, V> cRecord) {
@@ -2823,6 +2880,44 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 				}
 				catch (Exception ex) { // NOSONAR
 					throw decorateException(ex);
+				}
+			}
+		}
+
+		private void invokeErrorHandlerBySingleRecord(FailedRecordTuple<K, V> failedRecordTuple) {
+			final ConsumerRecord<K, V> cRecord = failedRecordTuple.record;
+			RuntimeException rte = failedRecordTuple.ex;
+			if (this.commonErrorHandler.seeksAfterHandling() || rte instanceof CommitFailedException) {
+				try {
+					if (this.producer == null) {
+						processCommits();
+					}
+				}
+				catch (Exception ex) { // NO SONAR
+					this.logger.error(ex, "Failed to commit before handling error");
+				}
+				List<ConsumerRecord<?, ?>> records = new ArrayList<>();
+				records.add(cRecord);
+				this.commonErrorHandler.handleRemaining(rte, records, this.consumer,
+														KafkaMessageListenerContainer.this.thisOrParentContainer);
+			}
+			else {
+				boolean handled = false;
+				try {
+					handled = this.commonErrorHandler.handleOne(rte, cRecord, this.consumer,
+																KafkaMessageListenerContainer.this.thisOrParentContainer);
+				}
+				catch (Exception ex) {
+					this.logger.error(ex, "ErrorHandler threw unexpected exception");
+				}
+				Map<TopicPartition, List<ConsumerRecord<K, V>>> records = new LinkedHashMap<>();
+				if (!handled) {
+					records.computeIfAbsent(new TopicPartition(cRecord.topic(), cRecord.partition()),
+											tp -> new ArrayList<>()).add(cRecord);
+				}
+				if (!records.isEmpty()) {
+					this.remainingRecords = new ConsumerRecords<>(records);
+					this.pauseForPending = true;
 				}
 			}
 		}
@@ -3297,6 +3392,10 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 						return recordList.get(recordList.size() - 1);
 					}))
 					.values();
+		}
+
+		private void callbackForAsyncFailure(ConsumerRecord<K, V> cRecord, RuntimeException ex) {
+			this.failedRecords.addLast(new FailedRecordTuple<>(cRecord, ex));
 		}
 
 		@Override
@@ -3912,5 +4011,7 @@ public class KafkaMessageListenerContainer<K, V> // NOSONAR line count
 		}
 
 	}
+
+	private record FailedRecordTuple<K, V>(ConsumerRecord<K, V> record, RuntimeException ex) { };
 
 }

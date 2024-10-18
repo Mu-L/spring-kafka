@@ -16,18 +16,6 @@
 
 package org.springframework.kafka.annotation;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
-import static org.awaitility.Awaitility.await;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyMap;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.BDDMockito.willAnswer;
-import static org.mockito.BDDMockito.willReturn;
-import static org.mockito.BDDMockito.willThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.spy;
-
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.lang.reflect.Type;
@@ -52,6 +40,13 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import io.micrometer.core.instrument.ImmutableTag;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.search.MeterNotFoundException;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
 import org.aopalliance.intercept.MethodInterceptor;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -152,6 +147,7 @@ import org.springframework.messaging.handler.annotation.support.MethodArgumentNo
 import org.springframework.messaging.handler.invocation.HandlerMethodArgumentResolver;
 import org.springframework.messaging.support.GenericMessage;
 import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.scheduling.concurrent.SimpleAsyncTaskScheduler;
 import org.springframework.stereotype.Component;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.TestPropertySource;
@@ -163,13 +159,17 @@ import org.springframework.util.MimeType;
 import org.springframework.validation.Errors;
 import org.springframework.validation.Validator;
 
-import io.micrometer.core.instrument.ImmutableTag;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
-import io.micrometer.core.instrument.search.MeterNotFoundException;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
-import jakarta.validation.Valid;
-import jakarta.validation.constraints.Max;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.BDDMockito.willReturn;
+import static org.mockito.BDDMockito.willThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 
 /**
  * @author Gary Russell
@@ -1489,8 +1489,9 @@ public class EnableKafkaIntegrationTests {
 			Map<String, Object> configs = consumerConfigs();
 			configs.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);
 			DefaultKafkaConsumerFactory<byte[], String> cf = new DefaultKafkaConsumerFactory<>(configs);
-			cf.addListener(new MicrometerConsumerListener<byte[], String>(meterRegistry(),
-					Collections.singletonList(new ImmutableTag("consumerTag", "bytesString"))));
+			cf.addListener(new MicrometerConsumerListener<>(meterRegistry(),
+					Collections.singletonList(new ImmutableTag("consumerTag", "bytesString")),
+					new SimpleAsyncTaskScheduler()));
 			return cf;
 		}
 
@@ -1580,7 +1581,8 @@ public class EnableKafkaIntegrationTests {
 			configs.put(ProducerConfig.CLIENT_ID_CONFIG, "bsPF");
 			DefaultKafkaProducerFactory<byte[], String> pf = new DefaultKafkaProducerFactory<>(configs);
 			pf.addListener(new MicrometerProducerListener<>(meterRegistry(),
-					Collections.singletonList(new ImmutableTag("producerTag", "bytesString"))));
+					Collections.singletonList(new ImmutableTag("producerTag", "bytesString")),
+					new SimpleAsyncTaskScheduler()));
 			return pf;
 		}
 
